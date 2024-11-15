@@ -11,6 +11,9 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
+from sklearn.metrics import roc_curve, auc
+from sklearn.model_selection import GridSearchCV
+
 
 # 自定义数据集类
 class RadiomicsDataset(Dataset):
@@ -30,6 +33,7 @@ features = data.iloc[:, :-1].values
 labels = data.iloc[:, -1].values
 num_features = len(features[0])
 num_classes = 2
+num_channels = 1
 
 # 数据标准化
 scaler = StandardScaler()
@@ -52,13 +56,27 @@ test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)    # 测试
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# 选择模型类型：'MLP', 'SVM', 'DecisionTree'
-model_type = 'DecisionTree'  # 可以选择 'MLP', 'SVM', 'DecisionTree'
+param_grid = {
+    'max_depth': [3, 5, 10, 15, 20],
+    'min_samples_split': [2, 5, 10, 20],
+    'min_samples_leaf': [1, 2, 5, 10],
+    'max_features': ['log2','sqrt',None],
+    'class_weight': ['balanced', None]
+}
 
-if model_type == 'MLP':
-    # MLP 模型（你可以换成你之前定义的模型）
-    from model import SimpleMLP
-    model = SimpleMLP(num_features, num_classes).to(device)
+# 选择模型类型：'MLP', 'SVM', 'DecisionTree', 'CNN', 'ResNet'
+model_type = 'DecisionTree'  # 可以选择 'MLP', 'SVM', 'DecisionTree', 'CNN', 'ResNet'
+
+if model_type == 'MLP' or model_type == 'Resnet' or model_type == 'CNN':
+    if model_type == 'Resnet':
+        from model import ResNet18_1D
+        model = ResNet18(num_channels,num_classes).to(device)
+    if model_type == 'CNN':
+        from model import SimpleCNN
+        model = SimpleCNN(num_channels, num_classes, num_features).to(device)
+    if model_type == 'MLP':
+        from model import SimpleMLP
+        model = SimpleMLP(num_features, num_classes).to(device)
     criterion = nn.CrossEntropyLoss()  # 交叉熵损失
     optimizer = optim.Adam(model.parameters(), lr=0.001)  # Adam优化器
 elif model_type == 'SVM':
@@ -73,7 +91,7 @@ num_epochs = 10
 
 # 训练和评估过程
 for epoch in range(num_epochs):
-    if model_type == 'MLP':
+    if model_type == 'MLP' or model_type == 'Resnet' or model_type == 'CNN':
         model.train()  # 设置模型为训练模式
         running_loss = 0.0  # 初始化累计损失
         for features_batch, labels_batch in train_loader:
@@ -138,7 +156,7 @@ for epoch in range(num_epochs):
     y_pred_test = []  # 存储测试集的预测标签
     y_prob_test = []  # 存储测试集的预测概率
 
-    if model_type == 'MLP':
+    if model_type == 'MLP' or model_type == 'Resnet' or model_type == 'CNN':
         with torch.no_grad():
             for features_batch, labels_batch in test_loader:
                 features_batch, labels_batch = features_batch.to(device), labels_batch.to(device)
@@ -172,10 +190,35 @@ for epoch in range(num_epochs):
             print(f"Warning: Confusion matrix has a single class in the prediction, skipping metrics calculation.")
     else:
         # 对于SVM和决策树，使用sklearn的API进行预测
-        model.fit(X_train, y_train)  # 训练模型
+        grid_search = GridSearchCV(estimator=model, param_grid=param_grid, cv=5, scoring='accuracy')
+        grid_search.fit(X_train, y_train)
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best cross-validation score: {grid_search.best_score_}")
+        model = grid_search.best_estimator_
+
+        # model.fit(X_train, y_train)  # 训练模型
         y_pred_test = model.predict(X_test)  # 预测标签
         if hasattr(model, "predict_proba"):  # 如果模型支持概率输出（SVM支持）
             y_prob_test = model.predict_proba(X_test)[:, 1]
+            fpr, tpr, _ = roc_curve(y_test, y_prob_test)
+            
+            # 计算 AUC（曲线下面积）
+            roc_auc = auc(fpr, tpr)
+            
+            # 绘制 ROC 曲线
+            plt.figure()
+            plt.plot(fpr, tpr, color='blue', label=f'ROC curve (AUC = {roc_auc:.2f})')
+            plt.plot([0, 1], [0, 1], color='gray', linestyle='--')  # 对角线
+            plt.xlabel('False Positive Rate')
+            plt.ylabel('True Positive Rate')
+            plt.title('Receiver Operating Characteristic (ROC) Curve')
+            plt.legend(loc='lower right')
+            
+            # 保存为 PNG 图片文件
+            plt.savefig(f'roc_curve_{epoch}.png', dpi=300)  # 保存为 PNG 文件，分辨率为 300
+            
+            # 显示图片
+            plt.show()
         else:
             y_prob_test = np.zeros_like(y_pred_test)  # 若没有概率输出，则置为0
 
@@ -193,7 +236,8 @@ for epoch in range(num_epochs):
             auc_test = roc_auc_score(y_test, y_prob_test)  # AUC
 
             # 打印测试集评估指标
-            print(f'Test Accuracy: {accuracy_test:.2f}%, '
+            print(f'Epoch: {epoch},'
+                f'Test Accuracy: {accuracy_test:.2f}%, '
                 f'Sensitivity: {sensitivity_test:.4f}, '
                 f'Specificity: {specificity_test:.4f}, '
                 f'PPV: {ppv_test:.4f}, '
@@ -202,14 +246,17 @@ for epoch in range(num_epochs):
         else:
             print(f"Warning: Confusion matrix has a single class in the prediction, skipping metrics calculation.")
 
+        fpr_test, tpr_test, thresholds = roc_curve(y_test, y_prob_test)
+        
+        # 计算 AUC
+        auc_test = auc(fpr_test, tpr_test)
+        
         # 绘制 ROC 曲线
-        fpr_test, tpr_test, _ = roc_curve(y_test, y_prob_test)
-
         plt.figure()
         plt.plot(fpr_test, tpr_test, label=f'Test AUC = {auc_test:.4f}')
         plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
-        plt.title(f'ROC Curve')
+        plt.title('ROC Curve')
         plt.legend(loc="lower right")
         plt.show()
